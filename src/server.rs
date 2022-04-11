@@ -12,13 +12,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::grpc_sys::{self, grpc_call_error, grpc_server};
+use cpu_observer::ObserverTagFactory;
 use futures_util::ready;
 
 use crate::call::server::*;
 use crate::call::{MessageReader, Method, MethodType};
 use crate::channel::ChannelArgs;
 use crate::cq::CompletionQueue;
-use crate::env::Environment;
+use crate::env::{attach_new_observer_tag, update_observer_tag, Environment};
 use crate::error::{Error, Result};
 use crate::task::{CallTag, CqFuture};
 use crate::RpcContext;
@@ -476,6 +477,7 @@ pub struct RequestCallContext {
     server: Arc<ServerCore>,
     registry: Arc<UnsafeCell<HashMap<&'static [u8], BoxHandler>>>,
     checkers: Vec<Box<dyn ServerChecker>>,
+    observer_tag_factory: Option<ObserverTagFactory>,
 }
 
 impl RequestCallContext {
@@ -483,6 +485,7 @@ impl RequestCallContext {
     /// TODO: Is there a better way?
     #[inline]
     pub unsafe fn get_handler(&mut self, path: &[u8]) -> Option<&mut BoxHandler> {
+        update_observer_tag(path);
         let registry = &mut *self.registry.get();
         registry.get_mut(path)
     }
@@ -507,6 +510,7 @@ pub fn request_call(ctx: RequestCallContext, cq: &CompletionQueue) {
         Err(_) => return,
         Ok(c) => c,
     };
+    attach_new_observer_tag(ctx.observer_tag_factory.as_ref());
     let server_ptr = ctx.server.server;
     let prom = CallTag::request(ctx);
     let request_ptr = prom.request_ctx().unwrap().as_ptr();
@@ -598,6 +602,7 @@ impl Server {
                     server: self.core.clone(),
                     registry: Arc::new(UnsafeCell::new(registry)),
                     checkers: self.checkers.clone(),
+                    observer_tag_factory: self.env.observer_tag_factory(),
                 };
                 for _ in 0..self.core.slots_per_cq {
                     request_call(rc.clone(), cq);

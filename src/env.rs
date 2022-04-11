@@ -1,35 +1,78 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
+
+use cpu_observer::{CollectorRegHandle, Guard, ObserverTag, ObserverTagFactory};
 
 use crate::grpc_sys;
 
 use crate::cq::{CompletionQueue, CompletionQueueHandle, EventType, WorkQueue};
 use crate::task::CallTag;
 
+thread_local! {
+    static OBSERVER_TAG: RefCell<Option<ObserverTag>> = RefCell::new(None);
+}
+
+pub(crate) fn attach_new_observer_tag(
+    observer_tag_factory: Option<&ObserverTagFactory>,
+) -> Option<Guard> {
+    OBSERVER_TAG.with(|tag| {
+        observer_tag_factory?;
+        let new_tag = observer_tag_factory.unwrap().new_tag("request_call");
+        let guard = new_tag.attach();
+        *tag.borrow_mut() = Some(new_tag);
+        Some(guard)
+    })
+}
+
+fn attach_cur_observer_tag(observer_tag_factory: Option<&ObserverTagFactory>) -> Option<Guard> {
+    OBSERVER_TAG.with(|tag| {
+        if let Some(cur_tag) = tag.borrow().as_ref() {
+            return Some(cur_tag.attach());
+        }
+        observer_tag_factory?;
+        attach_new_observer_tag(observer_tag_factory)
+    })
+}
+
+pub(crate) fn update_observer_tag(method_path: &[u8]) {
+    OBSERVER_TAG.with(|tag| {
+        if let Some(cur_tag) = tag.borrow().as_ref() {
+            cur_tag.update(String::from_utf8(method_path.to_vec()).unwrap());
+        }
+    });
+}
+
 // event loop
-fn poll_queue(tx: mpsc::Sender<CompletionQueue>) {
+fn poll_queue(tx: mpsc::Sender<CompletionQueue>, observer_tag_factory: Option<ObserverTagFactory>) {
     let cq = Arc::new(CompletionQueueHandle::new());
     let worker_info = Arc::new(WorkQueue::new());
     let cq = CompletionQueue::new(cq, worker_info);
     tx.send(cq.clone()).expect("send back completion queue");
+    let observer_tag_factory = observer_tag_factory.as_ref();
     loop {
-        let e = cq.next();
-        match e.type_ {
-            EventType::GRPC_QUEUE_SHUTDOWN => break,
-            // timeout should not happen in theory.
-            EventType::GRPC_QUEUE_TIMEOUT => continue,
-            EventType::GRPC_OP_COMPLETE => {}
+        {
+            // Get and resolve the request tag.
+            let _guard = attach_cur_observer_tag(observer_tag_factory);
+            let e = cq.next();
+            match e.type_ {
+                EventType::GRPC_QUEUE_SHUTDOWN => break,
+                // timeout should not happen in theory.
+                EventType::GRPC_QUEUE_TIMEOUT => continue,
+                EventType::GRPC_OP_COMPLETE => {}
+            }
+
+            let tag: Box<CallTag> = unsafe { Box::from_raw(e.tag as _) };
+            tag.resolve(&cq, e.success != 0);
         }
 
-        let tag: Box<CallTag> = unsafe { Box::from_raw(e.tag as _) };
-
-        tag.resolve(&cq, e.success != 0);
+        // Finish the unfinished work.
         while let Some(work) = unsafe { cq.worker.pop_work() } {
-            work.finish();
+            work.finish(observer_tag_factory);
         }
     }
 }
@@ -40,6 +83,8 @@ pub struct EnvBuilder {
     name_prefix: Option<String>,
     after_start: Option<Arc<dyn Fn() + Send + Sync>>,
     before_stop: Option<Arc<dyn Fn() + Send + Sync>>,
+    observer_tag_factory: Option<ObserverTagFactory>,
+    cpu_collector_reg_handle: Option<CollectorRegHandle>,
 }
 
 impl EnvBuilder {
@@ -50,6 +95,8 @@ impl EnvBuilder {
             name_prefix: None,
             after_start: None,
             before_stop: None,
+            observer_tag_factory: None,
+            cpu_collector_reg_handle: None,
         }
     }
 
@@ -83,6 +130,17 @@ impl EnvBuilder {
         self
     }
 
+    /// Init the CPU usage observer for the gRPC polling thread.
+    pub fn init_cpu_observer(
+        mut self,
+        observer_tag_factory: ObserverTagFactory,
+        cpu_collector_reg_handle: CollectorRegHandle,
+    ) -> EnvBuilder {
+        self.observer_tag_factory = Some(observer_tag_factory);
+        self.cpu_collector_reg_handle = Some(cpu_collector_reg_handle);
+        self
+    }
+
     /// Finalize the [`EnvBuilder`], build the [`Environment`] and initialize the gRPC library.
     pub fn build(self) -> Environment {
         unsafe {
@@ -99,12 +157,13 @@ impl EnvBuilder {
             }
             let after_start = self.after_start.clone();
             let before_stop = self.before_stop.clone();
+            let observer_tag_factory = self.observer_tag_factory.clone();
             let handle = builder
                 .spawn(move || {
                     if let Some(f) = after_start {
                         f();
                     }
-                    poll_queue(tx_i);
+                    poll_queue(tx_i, observer_tag_factory);
                     if let Some(f) = before_stop {
                         f();
                     }
@@ -120,6 +179,8 @@ impl EnvBuilder {
             cqs,
             idx: AtomicUsize::new(0),
             _handles: handles,
+            observer_tag_factory: self.observer_tag_factory,
+            cpu_collector_reg_handle: self.cpu_collector_reg_handle,
         }
     }
 }
@@ -129,6 +190,8 @@ pub struct Environment {
     cqs: Vec<CompletionQueue>,
     idx: AtomicUsize,
     _handles: Vec<JoinHandle<()>>,
+    observer_tag_factory: Option<ObserverTagFactory>,
+    cpu_collector_reg_handle: Option<CollectorRegHandle>,
 }
 
 impl Environment {
@@ -156,6 +219,14 @@ impl Environment {
     pub fn pick_cq(&self) -> CompletionQueue {
         let idx = self.idx.fetch_add(1, Ordering::Relaxed);
         self.cqs[idx % self.cqs.len()].clone()
+    }
+
+    pub(crate) fn observer_tag_factory(&self) -> Option<ObserverTagFactory> {
+        self.observer_tag_factory.clone()
+    }
+
+    pub fn cpu_collector_reg_handle(&self) -> Option<CollectorRegHandle> {
+        self.cpu_collector_reg_handle.clone()
     }
 }
 

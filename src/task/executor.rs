@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use cpu_observer::ObserverTagFactory;
 use futures_util::task::{waker_ref, ArcWake};
 
 use super::CallTag;
@@ -88,6 +89,7 @@ pub struct SpawnTask {
     state: AtomicU8,
     kicker: Kicker,
     queue: Arc<WorkQueue>,
+    path: Vec<u8>,
 }
 
 /// `SpawnTask` access is guarded by `state` field, which guarantees Sync.
@@ -96,12 +98,13 @@ pub struct SpawnTask {
 unsafe impl Sync for SpawnTask {}
 
 impl SpawnTask {
-    fn new(s: SpawnHandle, kicker: Kicker, queue: Arc<WorkQueue>) -> SpawnTask {
+    fn new(s: SpawnHandle, kicker: Kicker, queue: Arc<WorkQueue>, path: &str) -> SpawnTask {
         SpawnTask {
             handle: UnsafeCell::new(Some(s)),
             state: AtomicU8::new(IDLE),
             kicker,
             queue,
+            path: path.as_bytes().to_vec(),
         }
     }
 
@@ -174,7 +177,13 @@ impl ArcWake for SpawnTask {
 pub struct UnfinishedWork(Arc<SpawnTask>);
 
 impl UnfinishedWork {
-    pub fn finish(self) {
+    pub fn finish(self, observer_tag_factory: Option<&ObserverTagFactory>) {
+        let _guard;
+        if let Some(observer_tag_factory) = observer_tag_factory {
+            _guard = observer_tag_factory
+                .new_tag(String::from_utf8(self.0.path.clone()).unwrap())
+                .attach();
+        }
         resolve(self.0, true);
     }
 }
@@ -251,7 +260,16 @@ impl<'a> Executor<'a> {
         F: Future<Output = ()> + Send + 'static,
     {
         let s = Box::pin(f);
-        let notify = Arc::new(SpawnTask::new(s, kicker, self.cq.worker.clone()));
+        let notify = Arc::new(SpawnTask::new(s, kicker, self.cq.worker.clone(), "others"));
+        poll(notify, false)
+    }
+
+    pub fn spawn_with_method_path<F>(&self, f: F, kicker: Kicker, path: &str)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let s = Box::pin(f);
+        let notify = Arc::new(SpawnTask::new(s, kicker, self.cq.worker.clone(), path));
         poll(notify, false)
     }
 }

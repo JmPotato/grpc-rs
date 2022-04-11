@@ -17,6 +17,7 @@ autoexamples = false
 all-features = true
 
 [dependencies]
+cpu_observer = { git = "https://github.com/JmPotato/cpu_observer", branch = "main" }
 grpcio-sys = { path = "grpc-sys", version = "0.10.1", default-features = false }
 libc = "0.2"
 futures-executor = "0.3"

@@ -704,6 +704,13 @@ impl<'a> RpcContext<'a> {
     {
         self.executor.spawn(f, self.kicker())
     }
+
+    pub fn spawn_with_method_path<F>(&self, f: F, path: &str)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.executor.spawn_with_method_path(f, self.kicker(), path)
+    }
 }
 
 // Following four helper functions are used to create a callback closure.
