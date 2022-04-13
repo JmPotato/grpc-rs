@@ -18,6 +18,7 @@ use self::promise::{Action as ActionPromise, Batch as BatchPromise};
 use crate::call::server::RequestContext;
 use crate::call::{BatchContext, Call};
 use crate::cq::CompletionQueue;
+use crate::env::update_observer_tag;
 use crate::error::{Error, Result};
 use crate::server::RequestCallContext;
 
@@ -173,12 +174,27 @@ impl CallTag {
     /// Resolve the CallTag with given status.
     pub fn resolve(self, cq: &CompletionQueue, success: bool) {
         match self {
-            CallTag::Batch(prom) => prom.resolve(success),
-            CallTag::Request(cb) => cb.resolve(cq, success),
-            CallTag::UnaryRequest(cb) => cb.resolve(cq, success),
-            CallTag::Abort(_) => {}
-            CallTag::Action(prom) => prom.resolve(success),
-            CallTag::Spawn(notify) => self::executor::resolve(notify, success),
+            CallTag::Batch(prom) => {
+                update_observer_tag(b"batch_tag");
+                prom.resolve(success)
+            }
+            CallTag::Request(cb) => {
+                update_observer_tag(b"request_tag");
+                cb.resolve(cq, success)
+            }
+            CallTag::UnaryRequest(cb) => {
+                update_observer_tag(b"unary_request_tag");
+                cb.resolve(cq, success)
+            }
+            CallTag::Abort(_) => update_observer_tag(b"abort_tag"),
+            CallTag::Action(prom) => {
+                update_observer_tag(b"action_tag");
+                prom.resolve(success)
+            }
+            CallTag::Spawn(notify) => {
+                update_observer_tag(b"spawn_tag");
+                self::executor::resolve(notify, success)
+            }
         }
     }
 }

@@ -19,23 +19,14 @@ thread_local! {
 
 pub(crate) fn attach_new_observer_tag(
     observer_tag_factory: Option<&ObserverTagFactory>,
+    tag_name: &str,
 ) -> Option<Guard> {
     OBSERVER_TAG.with(|tag| {
         observer_tag_factory?;
-        let new_tag = observer_tag_factory.unwrap().new_tag("request_call");
+        let new_tag = observer_tag_factory.unwrap().new_tag(tag_name);
         let guard = new_tag.attach();
         *tag.borrow_mut() = Some(new_tag);
         Some(guard)
-    })
-}
-
-fn attach_cur_observer_tag(observer_tag_factory: Option<&ObserverTagFactory>) -> Option<Guard> {
-    OBSERVER_TAG.with(|tag| {
-        if let Some(cur_tag) = tag.borrow().as_ref() {
-            return Some(cur_tag.attach());
-        }
-        observer_tag_factory?;
-        attach_new_observer_tag(observer_tag_factory)
     })
 }
 
@@ -57,7 +48,7 @@ fn poll_queue(tx: mpsc::Sender<CompletionQueue>, observer_tag_factory: Option<Ob
     loop {
         {
             // Get and resolve the request tag.
-            let _guard = attach_cur_observer_tag(observer_tag_factory);
+            let _guard = attach_new_observer_tag(observer_tag_factory, "resolve_tag");
             let e = cq.next();
             match e.type_ {
                 EventType::GRPC_QUEUE_SHUTDOWN => break,
@@ -69,10 +60,12 @@ fn poll_queue(tx: mpsc::Sender<CompletionQueue>, observer_tag_factory: Option<Ob
             let tag: Box<CallTag> = unsafe { Box::from_raw(e.tag as _) };
             tag.resolve(&cq, e.success != 0);
         }
-
-        // Finish the unfinished work.
-        while let Some(work) = unsafe { cq.worker.pop_work() } {
-            work.finish(observer_tag_factory);
+        {
+            // Finish the unfinished work.
+            let _guard = attach_new_observer_tag(observer_tag_factory, "finish_work");
+            while let Some(work) = unsafe { cq.worker.pop_work() } {
+                work.finish();
+            }
         }
     }
 }
@@ -179,7 +172,6 @@ impl EnvBuilder {
             cqs,
             idx: AtomicUsize::new(0),
             _handles: handles,
-            observer_tag_factory: self.observer_tag_factory,
             cpu_collector_reg_handle: self.cpu_collector_reg_handle,
         }
     }
@@ -190,7 +182,6 @@ pub struct Environment {
     cqs: Vec<CompletionQueue>,
     idx: AtomicUsize,
     _handles: Vec<JoinHandle<()>>,
-    observer_tag_factory: Option<ObserverTagFactory>,
     cpu_collector_reg_handle: Option<CollectorRegHandle>,
 }
 
@@ -219,10 +210,6 @@ impl Environment {
     pub fn pick_cq(&self) -> CompletionQueue {
         let idx = self.idx.fetch_add(1, Ordering::Relaxed);
         self.cqs[idx % self.cqs.len()].clone()
-    }
-
-    pub(crate) fn observer_tag_factory(&self) -> Option<ObserverTagFactory> {
-        self.observer_tag_factory.clone()
     }
 
     pub fn cpu_collector_reg_handle(&self) -> Option<CollectorRegHandle> {

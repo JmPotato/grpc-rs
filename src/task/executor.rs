@@ -14,12 +14,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use cpu_observer::ObserverTagFactory;
 use futures_util::task::{waker_ref, ArcWake};
 
 use super::CallTag;
 use crate::call::Call;
 use crate::cq::{CompletionQueue, WorkQueue};
+use crate::env::update_observer_tag;
 use crate::error::{Error, Result};
 use crate::grpc_sys::{self, grpc_call_error};
 
@@ -177,13 +177,8 @@ impl ArcWake for SpawnTask {
 pub struct UnfinishedWork(Arc<SpawnTask>);
 
 impl UnfinishedWork {
-    pub fn finish(self, observer_tag_factory: Option<&ObserverTagFactory>) {
-        let _guard;
-        if let Some(observer_tag_factory) = observer_tag_factory {
-            _guard = observer_tag_factory
-                .new_tag(String::from_utf8(self.0.path.clone()).unwrap())
-                .attach();
-        }
+    pub fn finish(self) {
+        update_observer_tag(&self.0.path);
         resolve(self.0, true);
     }
 }
@@ -260,7 +255,12 @@ impl<'a> Executor<'a> {
         F: Future<Output = ()> + Send + 'static,
     {
         let s = Box::pin(f);
-        let notify = Arc::new(SpawnTask::new(s, kicker, self.cq.worker.clone(), "others"));
+        let notify = Arc::new(SpawnTask::new(
+            s,
+            kicker,
+            self.cq.worker.clone(),
+            "spawned_task",
+        ));
         poll(notify, false)
     }
 
